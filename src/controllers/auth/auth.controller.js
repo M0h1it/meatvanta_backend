@@ -4,12 +4,10 @@ const { success, failure } = require("../../utils/apiResponse.util");
 const { writeAuditLog } = require("../../utils/auditLogger.util");
 const { COOKIE_NAME } = require("../../middlewares/auth.middleware");
 
-const isProd = process.env.NODE_ENV === "production";
+const { baseCookieOptions } = require("../../utils/cookiePolicy.util");
 
 const cookieOptions = {
-  httpOnly: true,
-  secure: isProd,          // requires HTTPS in production
-  sameSite: isProd ? "strict" : "lax",
+  ...baseCookieOptions(),
   maxAge: 8 * 60 * 60 * 1000, // 8 hours, keep in sync with JWT_EXPIRES_IN
 };
 

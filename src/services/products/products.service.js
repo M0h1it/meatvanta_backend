@@ -1,6 +1,8 @@
 const prisma = require("../../config/db");
 const path = require("path");
 const { toPublicUrl, deleteLocalImage, UPLOADS_DIR } = require("../../utils/localImageStorage.util");
+const { uploadToR2, deleteFromR2, toR2PublicUrl, isR2Configured } = require("../../utils/r2Storage.util");
+const { slugify } = require("../../utils/slugify.util");
 
 function notFoundError(message) {
   const err = new Error(message);
@@ -152,27 +154,44 @@ async function toggleVariantStock(variantId, isInStock) {
  * We just record the path/URL in the DB and clean up the previous file.
  */
 async function setProductImage(id, file) {
-  const product = await prisma.product.findUnique({ where: { id } });
+  const product = await prisma.product.findUnique({
+    where: { id },
+    include: { category: true },
+  });
   if (!product) {
-    // Product doesn't exist - the file was already written to disk by multer
-    // before this check ran, so the controller cleans it up on this error.
+    // In disk mode multer has already written the file by the time we get
+    // here, so the controller cleans it up when this throws.
     throw notFoundError("Product not found.");
   }
 
-  // Derived from the actual file location multer wrote to (category-slug
-  // folder) rather than assumed - stays correct no matter which folder
-  // structure the upload middleware uses.
-  const relativePath = path.relative(UPLOADS_DIR, file.path);
-  const imageUrl = toPublicUrl(relativePath);
+  let storedPath;
+  let imageUrl;
+
+  if (isR2Configured) {
+    // Same folder-per-category shape as local disk, so the two modes stay
+    // readable side by side.
+    const ext = (file.originalname.match(/\.[a-z0-9]+$/i) || [".jpg"])[0].toLowerCase();
+    storedPath = `${product.category.slug}/${slugify(product.name)}-${Date.now()}${ext}`;
+    await uploadToR2(file.buffer, storedPath, file.mimetype);
+    imageUrl = toR2PublicUrl(storedPath);
+  } else {
+    storedPath = path.relative(UPLOADS_DIR, file.path);
+    imageUrl = toPublicUrl(storedPath);
+  }
 
   const updated = await prisma.product.update({
     where: { id },
-    data: { imageUrl, imagePath: relativePath },
+    data: { imageUrl, imagePath: storedPath },
     include: productInclude,
   });
 
+  // Remove the previous image only after the new one is safely stored.
   if (product.imagePath) {
-    deleteLocalImage(product.imagePath); // best-effort, won't throw
+    if (isR2Configured) {
+      await deleteFromR2(product.imagePath);
+    } else {
+      deleteLocalImage(product.imagePath);
+    }
   }
 
   return updated;
@@ -183,7 +202,11 @@ async function removeProductImage(id) {
   if (!product) throw notFoundError("Product not found.");
 
   if (product.imagePath) {
-    deleteLocalImage(product.imagePath);
+    if (isR2Configured) {
+      await deleteFromR2(product.imagePath);
+    } else {
+      deleteLocalImage(product.imagePath);
+    }
   }
 
   return prisma.product.update({

@@ -9,15 +9,7 @@ const {
   CUSTOMER_REFRESH_COOKIE,
 } = require("../../middlewares/customerAuth.middleware");
 
-const isProd = process.env.NODE_ENV === "production";
-
-function baseCookieOptions() {
-  return {
-    httpOnly: true,
-    secure: isProd,
-    sameSite: isProd ? "strict" : "lax",
-  };
-}
+const { baseCookieOptions } = require("../../utils/cookiePolicy.util");
 
 function setSessionCookies(res, tokens) {
   res.cookie(CUSTOMER_ACCESS_COOKIE, tokens.accessToken, {
