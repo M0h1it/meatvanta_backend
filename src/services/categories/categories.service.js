@@ -30,11 +30,21 @@ async function createCategory({ name, sortOrder }) {
   });
 }
 
-async function listCategories({ includeInactive = false } = {}) {
+async function listCategories({ includeInactive = false, countAvailableOnly = false } = {}) {
   return prisma.category.findMany({
     where: includeInactive ? {} : { isActive: true },
     orderBy: [{ sortOrder: "asc" }, { name: "asc" }],
-    include: { _count: { select: { products: true } } },
+    include: {
+      _count: {
+        select: {
+          // The customer site advertises "N items available", so its count has
+          // to match what the product list will actually show - otherwise the
+          // homepage promises items the shop pulled for the day.
+          // The admin keeps the unfiltered total, which is what it needs.
+          products: countAvailableOnly ? { where: { isActive: true, isInStock: true } } : true,
+        },
+      },
+    },
   });
 }
 

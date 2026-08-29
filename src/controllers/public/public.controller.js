@@ -11,7 +11,10 @@ const { success, failure } = require("../../utils/apiResponse.util");
 
 async function listCategories(req, res, next) {
   try {
-    const categories = await categoriesService.listCategories({ includeInactive: false });
+    const categories = await categoriesService.listCategories({
+      includeInactive: false,
+      countAvailableOnly: true,
+    });
     return success(res, 200, "Categories fetched.", { categories });
   } catch (err) {
     return next(err);
@@ -65,6 +68,8 @@ async function createOrder(req, res, next) {
         paymentMethod: order.paymentMethod,
         paymentStatus: order.paymentStatus,
         deliveryChargeStatus: order.deliveryChargeStatus,
+    // Lets the customer see who is bringing the order once it is out for delivery.
+    deliveryPersonName: order.deliveryPersonName,
         subtotal: order.subtotal,
         deliveryCharge: order.deliveryCharge,
         total: order.total,
@@ -99,6 +104,8 @@ async function trackOrder(req, res, next) {
         deliveryEndTime: order.deliveryEndTime,
         deliveryAddress: order.deliveryAddress,
         deliveryChargeStatus: order.deliveryChargeStatus,
+    // Lets the customer see who is bringing the order once it is out for delivery.
+    deliveryPersonName: order.deliveryPersonName,
         subtotal: order.subtotal,
         deliveryCharge: order.deliveryCharge,
         total: order.total,
@@ -125,6 +132,8 @@ function toCustomerOrderView(order) {
     deliveryEndTime: order.deliveryEndTime,
     deliveryAddress: order.deliveryAddress,
     deliveryChargeStatus: order.deliveryChargeStatus,
+    // Lets the customer see who is bringing the order once it is out for delivery.
+    deliveryPersonName: order.deliveryPersonName,
     subtotal: order.subtotal,
     deliveryCharge: order.deliveryCharge,
     total: order.total,
