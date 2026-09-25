@@ -28,6 +28,16 @@ async function requireAuth(req, res, next) {
       return failure(res, 401, "Session is no longer valid.");
     }
 
+    // A password reset must end every existing session. JWTs can't be revoked,
+    // so any token issued before the last password change is rejected here -
+    // otherwise a stolen token would keep working until it expired naturally.
+    if (admin.passwordChangedAt && payload.iat) {
+      const issuedAtMs = payload.iat * 1000; // iat is in seconds
+      if (issuedAtMs < admin.passwordChangedAt.getTime()) {
+        return failure(res, 401, "Your password was changed. Please sign in again.");
+      }
+    }
+
     req.admin = {
       id: admin.id,
       name: admin.name,

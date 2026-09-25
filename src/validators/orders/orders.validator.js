@@ -1,6 +1,11 @@
 const ORDER_STATUSES = ["placed", "preparing", "out_for_delivery", "delivered", "cancelled"];
-const PAYMENT_METHODS = ["cod", "upi"];
-const PAYMENT_STATUSES = ["unpaid", "submitted", "verified", "rejected", "paid"];
+// "upi" is kept only for staff-entered phone orders (admin's own order-entry
+// screen) and for reading old order history - it is no longer offered on the
+// customer-facing checkout, see CUSTOMER_PAYMENT_METHODS below.
+const PAYMENT_METHODS = ["cod", "upi", "razorpay"];
+// What a customer placing an order online may actually choose.
+const CUSTOMER_PAYMENT_METHODS = ["cod", "razorpay"];
+const PAYMENT_STATUSES = ["unpaid", "submitted", "verified", "rejected", "pending", "paid", "failed"];
 const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 
 // What each status is allowed to move to next - keeps the workflow linear
@@ -72,12 +77,13 @@ function validateStatusUpdate(currentStatus, requestedStatus) {
 
 /**
  * Customer-site order submission. Stricter than the admin's version: address
- * and delivery date are required (staff taking a phone order may skip them),
- * and UPI orders must carry some form of payment proof.
+ * and delivery date are required (staff taking a phone order may skip them).
+ * Payment is either "cod" or "razorpay" - manual UPI proof-paste is no longer
+ * offered here (see CUSTOMER_PAYMENT_METHODS).
  */
 function validatePublicCreateOrder(body) {
   const errors = {};
-  const { customerName, customerPhone, deliveryAddress, deliveryDate, items, paymentMethod, upiReceiptText, upiTransactionId } = body || {};
+  const { customerName, customerPhone, deliveryAddress, deliveryDate, items, paymentMethod } = body || {};
 
   if (!customerName || typeof customerName !== "string" || customerName.trim().length < 2) {
     errors.customerName = "Please enter your name.";
@@ -107,20 +113,14 @@ function validatePublicCreateOrder(body) {
       .filter(Boolean);
     if (itemErrors.length > 0) errors.itemDetails = itemErrors;
   }
-  if (!PAYMENT_METHODS.includes(paymentMethod)) {
-    errors.paymentMethod = "Please choose a payment method.";
-  }
-  if (paymentMethod === "upi") {
-    const hasReceipt = typeof upiReceiptText === "string" && upiReceiptText.trim().length > 0;
-    const hasUtr = typeof upiTransactionId === "string" && upiTransactionId.trim().length > 0;
-    if (!hasReceipt && !hasUtr) {
-      errors.upiProof = "Paste your payment receipt or enter the UTR/transaction ID.";
-    }
+  if (!CUSTOMER_PAYMENT_METHODS.includes(paymentMethod)) {
+    errors.paymentMethod = `Please choose a payment method (${CUSTOMER_PAYMENT_METHODS.join(" or ")}).`;
   }
 
   return { isValid: Object.keys(errors).length === 0, errors };
 }
 
+/** Admin confirming/rejecting a legacy manual-UPI (phone order) payment. */
 function validatePaymentVerification(body) {
   const errors = {};
   const { paymentStatus, paymentNote } = body || {};
@@ -135,13 +135,33 @@ function validatePaymentVerification(body) {
   return { isValid: Object.keys(errors).length === 0, errors };
 }
 
+/** What the browser hands back after Razorpay's checkout widget succeeds. */
+function validateRazorpayVerification(body) {
+  const errors = {};
+  const { razorpayOrderId, razorpayPaymentId, razorpaySignature } = body || {};
+
+  if (!razorpayOrderId || typeof razorpayOrderId !== "string") {
+    errors.razorpayOrderId = "razorpayOrderId is required.";
+  }
+  if (!razorpayPaymentId || typeof razorpayPaymentId !== "string") {
+    errors.razorpayPaymentId = "razorpayPaymentId is required.";
+  }
+  if (!razorpaySignature || typeof razorpaySignature !== "string") {
+    errors.razorpaySignature = "razorpaySignature is required.";
+  }
+
+  return { isValid: Object.keys(errors).length === 0, errors };
+}
+
 module.exports = {
   ORDER_STATUSES,
   PAYMENT_METHODS,
+  CUSTOMER_PAYMENT_METHODS,
   PAYMENT_STATUSES,
   ALLOWED_TRANSITIONS,
   validateCreateOrder,
   validateStatusUpdate,
   validatePublicCreateOrder,
   validatePaymentVerification,
+  validateRazorpayVerification,
 };

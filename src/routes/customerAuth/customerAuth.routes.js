@@ -6,16 +6,9 @@ const controller = require("../../controllers/customerAuth/customerAuth.controll
 const addressController = require("../../controllers/customerAddresses/customerAddresses.controller");
 const { requireCustomerAuth } = require("../../middlewares/customerAuth.middleware");
 
-// Tighter than the admin login limiter - this endpoint will cost real money
-// per request once an SMS provider is wired in.
-const otpRequestLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 5,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { success: false, message: "Too many code requests. Please try again shortly.", errors: null },
-});
-
+// Sending/matching the OTP itself now happens entirely on MSG91's side (the
+// widget talks to MSG91 directly from the browser) - this only rate-limits
+// how often a browser can ask OUR backend to confirm an access-token.
 const otpVerifyLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 15,
@@ -24,7 +17,6 @@ const otpVerifyLimiter = rateLimit({
   message: { success: false, message: "Too many attempts. Please try again shortly.", errors: null },
 });
 
-router.post("/request-otp", otpRequestLimiter, controller.requestOtp);
 router.post("/verify-otp", otpVerifyLimiter, controller.verifyOtp);
 router.post("/refresh", controller.refresh);
 router.post("/logout", controller.logout);

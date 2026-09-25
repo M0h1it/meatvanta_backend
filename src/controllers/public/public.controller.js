@@ -1,7 +1,11 @@
 const categoriesService = require("../../services/categories/categories.service");
 const productsService = require("../../services/products/products.service");
 const ordersService = require("../../services/orders/orders.service");
-const { validatePublicCreateOrder } = require("../../validators/orders/orders.validator");
+const razorpayService = require("../../services/payments/razorpay.service");
+const {
+  validatePublicCreateOrder,
+  validateRazorpayVerification,
+} = require("../../validators/orders/orders.validator");
 const { success, failure } = require("../../utils/apiResponse.util");
 
 // No auth on any of these - this is the customer-facing read surface.
@@ -55,10 +59,52 @@ async function createOrder(req, res, next) {
     if (!isValid) return failure(res, 422, "Please check your order details.", errors);
 
     // req.customer is set by attachCustomerIfPresent when signed in, absent for guests.
-    const order = await ordersService.createPublicOrder(req.body, req.customer?.id ?? null);
+    const { order, razorpayOrderId, razorpayKeyId, amount } =
+      await ordersService.createPublicOrder(req.body, req.customer?.id ?? null);
 
-    // Only what the customer needs back - no internal ids or admin fields.
-    return success(res, 201, "Order placed.", {
+    // For "cod", `order` is the real, already-created Order. For "razorpay",
+    // nothing has been created yet - only a Razorpay order + a priced draft
+    // (see createPublicOrder) - so `order` is null here and the frontend
+    // works off razorpayOrderId/amount until payment actually succeeds.
+    return success(res, 201, order ? "Order placed." : "Checkout ready for payment.", {
+      order: order
+        ? {
+            orderNumber: order.orderNumber,
+            customerName: order.customerName,
+            deliveryDate: order.deliveryDate,
+            deliveryStartTime: order.deliveryStartTime,
+            deliveryEndTime: order.deliveryEndTime,
+            paymentMethod: order.paymentMethod,
+            paymentStatus: order.paymentStatus,
+            deliveryChargeStatus: order.deliveryChargeStatus,
+            // Lets the customer see who is bringing the order once it is out for delivery.
+            deliveryPersonName: order.deliveryPersonName,
+            subtotal: order.subtotal,
+            deliveryCharge: order.deliveryCharge,
+            total: order.total,
+            status: order.status,
+            items: order.items,
+          }
+        : null,
+      razorpayOrderId: razorpayOrderId || undefined,
+      razorpayKeyId: razorpayKeyId || undefined,
+      amount: amount || undefined,
+    });
+  } catch (err) {
+    if (err.expose) return failure(res, err.statusCode, err.message);
+    return next(err);
+  }
+}
+
+/** Called by the checkout page right after Razorpay's widget reports success. */
+async function verifyRazorpayPayment(req, res, next) {
+  try {
+    const { isValid, errors } = validateRazorpayVerification(req.body);
+    if (!isValid) return failure(res, 422, "Missing payment details.", errors);
+
+    const order = await ordersService.verifyRazorpayPayment(req.body);
+
+    return success(res, 200, "Payment verified.", {
       order: {
         orderNumber: order.orderNumber,
         customerName: order.customerName,
@@ -68,8 +114,7 @@ async function createOrder(req, res, next) {
         paymentMethod: order.paymentMethod,
         paymentStatus: order.paymentStatus,
         deliveryChargeStatus: order.deliveryChargeStatus,
-    // Lets the customer see who is bringing the order once it is out for delivery.
-    deliveryPersonName: order.deliveryPersonName,
+        deliveryPersonName: order.deliveryPersonName,
         subtotal: order.subtotal,
         deliveryCharge: order.deliveryCharge,
         total: order.total,
@@ -80,6 +125,41 @@ async function createOrder(req, res, next) {
   } catch (err) {
     if (err.expose) return failure(res, err.statusCode, err.message);
     return next(err);
+  }
+}
+
+/**
+ * Razorpay calls this directly (not the browser) - it's a safety net for a
+ * customer whose browser closed right after paying, before the widget's own
+ * success callback could run. Always answers 200 once the signature check is
+ * done, because a non-200 makes Razorpay retry the same event repeatedly.
+ */
+async function razorpayWebhook(req, res) {
+  try {
+    const signature = req.headers["x-razorpay-signature"];
+    const isValid = razorpayService.verifyWebhookSignature({ rawBody: req.rawBody, signature });
+    if (!isValid) {
+      return res.status(400).json({ success: false, message: "Invalid webhook signature." });
+    }
+
+    const event = req.body;
+    if (event.event === "payment.captured" || event.event === "order.paid") {
+      const payment = event.payload?.payment?.entity;
+      if (payment?.order_id && payment?.id) {
+        await ordersService.markOrderPaidFromWebhook({
+          razorpayOrderId: payment.order_id,
+          razorpayPaymentId: payment.id,
+        });
+      }
+    }
+
+    return res.status(200).json({ success: true });
+  } catch (err) {
+    // Log-and-200: Razorpay's retry-on-failure makes a 5xx here worse, not
+    // better - the widget-driven verify call is the primary path anyway.
+    // eslint-disable-next-line no-console
+    console.error("Razorpay webhook error:", err);
+    return res.status(200).json({ success: false });
   }
 }
 
@@ -104,8 +184,8 @@ async function trackOrder(req, res, next) {
         deliveryEndTime: order.deliveryEndTime,
         deliveryAddress: order.deliveryAddress,
         deliveryChargeStatus: order.deliveryChargeStatus,
-    // Lets the customer see who is bringing the order once it is out for delivery.
-    deliveryPersonName: order.deliveryPersonName,
+        // Lets the customer see who is bringing the order once it is out for delivery.
+        deliveryPersonName: order.deliveryPersonName,
         subtotal: order.subtotal,
         deliveryCharge: order.deliveryCharge,
         total: order.total,
@@ -170,6 +250,8 @@ module.exports = {
   listProducts,
   getProduct,
   createOrder,
+  verifyRazorpayPayment,
+  razorpayWebhook,
   trackOrder,
   myOrders,
   myOrderDetail,

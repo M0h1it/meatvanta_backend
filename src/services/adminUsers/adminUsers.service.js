@@ -21,7 +21,7 @@ function stripPasswordHash(admin) {
   return safeAdmin;
 }
 
-async function createAdminUser({ name, email, password, roleId }) {
+async function createAdminUser({ name, email, password, roleId, phone }) {
   const role = await prisma.role.findUnique({ where: { id: roleId } });
   if (!role) throw notFoundError("roleId does not match any existing role.");
 
@@ -31,7 +31,7 @@ async function createAdminUser({ name, email, password, roleId }) {
   const passwordHash = await hashPassword(password);
 
   const admin = await prisma.adminUser.create({
-    data: { name: name.trim(), email, passwordHash, roleId },
+    data: { name: name.trim(), email, passwordHash, roleId, phone: phone ? String(phone).trim() : null },
     include: adminInclude,
   });
 
@@ -84,6 +84,7 @@ async function updateAdminUser(id, { name, roleId, isActive }, actingAdminId) {
   if (name !== undefined) data.name = name.trim();
   if (roleId !== undefined) data.roleId = roleId;
   if (isActive !== undefined) data.isActive = isActive;
+  if (phone !== undefined) data.phone = phone ? String(phone).trim() : null;
 
   const updated = await prisma.adminUser.update({ where: { id }, data, include: adminInclude });
   return stripPasswordHash(updated);

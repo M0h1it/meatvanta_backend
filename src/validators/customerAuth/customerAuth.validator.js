@@ -1,25 +1,15 @@
-const PHONE_PATTERN = /^[0-9]{10}$/;
-
-function validateOtpRequest(body) {
-  const errors = {};
-  const { phone } = body || {};
-
-  if (!phone || typeof phone !== "string" || !PHONE_PATTERN.test(phone.trim())) {
-    errors.phone = "Enter a valid 10-digit mobile number.";
-  }
-
-  return { isValid: Object.keys(errors).length === 0, errors };
-}
-
+/**
+ * The only thing the widget-based OTP flow hands our backend is the
+ * access-token MSG91 issued once the customer entered the right code -
+ * there's no phone/otp pair to validate here anymore (see
+ * customerAuth.service.js verifyOtp / msg91.service.js).
+ */
 function validateOtpVerification(body) {
   const errors = {};
-  const { phone, otp, name } = body || {};
+  const { accessToken, name } = body || {};
 
-  if (!phone || typeof phone !== "string" || !PHONE_PATTERN.test(phone.trim())) {
-    errors.phone = "Enter a valid 10-digit mobile number.";
-  }
-  if (!otp || typeof otp !== "string" || !/^[0-9]{6}$/.test(otp.trim())) {
-    errors.otp = "Enter the 6-digit code.";
+  if (!accessToken || typeof accessToken !== "string" || accessToken.trim().length < 10) {
+    errors.accessToken = "Missing verification token.";
   }
   // name is optional - only required for a phone number with no account yet,
   // which the service decides since only it knows if the customer exists.
@@ -30,4 +20,4 @@ function validateOtpVerification(body) {
   return { isValid: Object.keys(errors).length === 0, errors };
 }
 
-module.exports = { validateOtpRequest, validateOtpVerification };
+module.exports = { validateOtpVerification };

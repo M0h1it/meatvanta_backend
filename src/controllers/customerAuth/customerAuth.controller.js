@@ -1,8 +1,5 @@
 const customerAuthService = require("../../services/customerAuth/customerAuth.service");
-const {
-  validateOtpRequest,
-  validateOtpVerification,
-} = require("../../validators/customerAuth/customerAuth.validator");
+const { validateOtpVerification } = require("../../validators/customerAuth/customerAuth.validator");
 const { success, failure } = require("../../utils/apiResponse.util");
 const {
   CUSTOMER_ACCESS_COOKIE,
@@ -27,19 +24,12 @@ function clearSessionCookies(res) {
   res.clearCookie(CUSTOMER_REFRESH_COOKIE, baseCookieOptions());
 }
 
-async function requestOtp(req, res, next) {
-  try {
-    const { isValid, errors } = validateOtpRequest(req.body);
-    if (!isValid) return failure(res, 422, "Please check the number entered.", errors);
-
-    const result = await customerAuthService.requestOtp(req.body.phone);
-    return success(res, 200, "Verification code sent.", result);
-  } catch (err) {
-    if (err.expose) return failure(res, err.statusCode, err.message);
-    return next(err);
-  }
-}
-
+/**
+ * The MSG91 OTP Widget handles sending/matching the code entirely on its own
+ * (from the browser, directly to MSG91) - this endpoint only ever sees the
+ * access-token the widget hands back once the customer typed the right code,
+ * and confirms it server-side before a session is ever issued.
+ */
 async function verifyOtp(req, res, next) {
   try {
     const { isValid, errors } = validateOtpVerification(req.body);
@@ -95,4 +85,4 @@ async function me(req, res, next) {
   }
 }
 
-module.exports = { requestOtp, verifyOtp, refresh, logout, me };
+module.exports = { verifyOtp, refresh, logout, me };

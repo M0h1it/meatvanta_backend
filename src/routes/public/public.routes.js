@@ -26,6 +26,19 @@ router.use("/auth", customerAuthRoutes);
 // to an account when there is one, without requiring it.
 router.post("/orders", attachCustomerIfPresent, publicController.createOrder);
 
+// Called by the checkout page right after Razorpay's widget reports success.
+// No :orderNumber here - for "razorpay" checkouts, no Order exists yet at
+// this point (see createPublicOrder / promotePendingCheckout); the
+// razorpayOrderId in the body is what identifies which pending checkout to
+// turn into a real order.
+router.post("/orders/razorpay/verify", publicController.verifyRazorpayPayment);
+
+// Called by Razorpay's servers directly, not the browser - a safety net for a
+// payment whose browser closed before the widget's success callback ran.
+// No auth (Razorpay can't send our cookies) - the raw-body signature check in
+// the controller is what proves this call is genuinely from Razorpay.
+router.post("/webhooks/razorpay", publicController.razorpayWebhook);
+
 // Signed-in customers get their order history instead of retyping order numbers.
 router.get("/my-orders", requireCustomerAuth, publicController.myOrders);
 router.get("/my-orders/:orderNumber", requireCustomerAuth, publicController.myOrderDetail);

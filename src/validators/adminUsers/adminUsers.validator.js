@@ -1,6 +1,8 @@
+const PHONE_PATTERN = /^[0-9]{10}$/;
+
 function validateCreateAdminUser(body) {
   const errors = {};
-  const { name, email, password, roleId } = body || {};
+  const { name, email, password, roleId, phone } = body || {};
 
   if (!name || typeof name !== "string" || name.trim().length < 2) {
     errors.name = "Name is required (min 2 characters).";
@@ -14,13 +16,17 @@ function validateCreateAdminUser(body) {
   if (!roleId || typeof roleId !== "number") {
     errors.roleId = "roleId is required.";
   }
+  // Optional, but without it this admin can never reset their own password.
+  if (phone !== undefined && phone !== null && phone !== "" && !PHONE_PATTERN.test(String(phone).trim())) {
+    errors.phone = "Enter a valid 10-digit mobile number.";
+  }
 
   return { isValid: Object.keys(errors).length === 0, errors };
 }
 
 function validateUpdateAdminUser(body) {
   const errors = {};
-  const { name, roleId, isActive } = body || {};
+  const { name, roleId, isActive, phone } = body || {};
 
   if (name !== undefined && (typeof name !== "string" || name.trim().length < 2)) {
     errors.name = "Name must be at least 2 characters.";
@@ -30,6 +36,9 @@ function validateUpdateAdminUser(body) {
   }
   if (isActive !== undefined && typeof isActive !== "boolean") {
     errors.isActive = "isActive must be true or false.";
+  }
+  if (phone !== undefined && phone !== null && phone !== "" && !PHONE_PATTERN.test(String(phone).trim())) {
+    errors.phone = "Enter a valid 10-digit mobile number.";
   }
 
   return { isValid: Object.keys(errors).length === 0, errors };

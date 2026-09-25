@@ -1,19 +1,12 @@
 const prisma = require("../../config/db");
-const { generateOtp, hashOtp, compareOtp } = require("../../utils/otp.util");
+const msg91Service = require("../msg91/msg91.service");
 const {
   signCustomerAccessToken,
   generateRefreshToken,
   hashRefreshToken,
 } = require("../../utils/customerJwt.util");
 
-const OTP_TTL_MINUTES = 10;
-const MAX_VERIFY_ATTEMPTS = 5;
-const RESEND_COOLDOWN_SECONDS = 60;
 const REFRESH_TOKEN_TTL_DAYS = 30;
-
-// Without an SMS provider wired up, dev mode returns the code in the API
-// response so the flow is testable. Must be off in production.
-const IS_DEV_OTP = process.env.OTP_DEV_MODE === "true";
 
 function badRequestError(message, statusCode = 400) {
   const err = new Error(message);
@@ -23,98 +16,27 @@ function badRequestError(message, statusCode = 400) {
 }
 
 /**
- * Issues an OTP for a phone number. Doesn't reveal whether the number is a
- * known customer - the response is identical either way, so this endpoint
- * can't be used to enumerate who has an account.
+ * Verifies the MSG91 OTP Widget's access-token and logs the customer in,
+ * creating the account on first successful verification (no separate signup
+ * step). OTP generation/delivery/matching all happen on MSG91's side now
+ * (the widget talks to MSG91 directly from the browser) - this function's
+ * only job is confirming that access-token server-side before trusting it,
+ * then mapping the now-verified phone number onto a Customer row.
  */
-async function requestOtp(phone) {
-  const normalizedPhone = phone.trim();
+async function verifyOtp({ accessToken, name }) {
+  const phone = await msg91Service.verifyWidgetAccessToken(accessToken);
 
-  // Cooldown: stops someone hammering the endpoint (and, later, burning SMS credit).
-  const recent = await prisma.otpRequest.findFirst({
-    where: { phone: normalizedPhone, consumedAt: null },
-    orderBy: { createdAt: "desc" },
-  });
-  if (recent) {
-    const secondsSince = (Date.now() - recent.createdAt.getTime()) / 1000;
-    if (secondsSince < RESEND_COOLDOWN_SECONDS) {
-      throw badRequestError(
-        `Please wait ${Math.ceil(RESEND_COOLDOWN_SECONDS - secondsSince)}s before requesting another code.`,
-        429
-      );
-    }
-  }
-
-  // Any older unconsumed codes for this number stop working the moment a new
-  // one is issued - only the newest code is ever valid.
-  await prisma.otpRequest.updateMany({
-    where: { phone: normalizedPhone, consumedAt: null },
-    data: { consumedAt: new Date() },
-  });
-
-  const otp = generateOtp();
-  const otpHash = await hashOtp(otp);
-  const expiresAt = new Date(Date.now() + OTP_TTL_MINUTES * 60 * 1000);
-
-  await prisma.otpRequest.create({
-    data: { phone: normalizedPhone, otpHash, expiresAt },
-  });
-
-  if (IS_DEV_OTP) {
-    console.log(`[otp] ${normalizedPhone} -> ${otp}`);
-  }
-  // TODO: send via SMS provider once one is configured.
-
-  return {
-    expiresInMinutes: OTP_TTL_MINUTES,
-    // Only ever populated in dev mode - never leaks the code in production.
-    devOtp: IS_DEV_OTP ? otp : undefined,
-  };
-}
-
-/**
- * Verifies the code and logs the customer in, creating the account on first
- * successful verification (no separate signup step).
- */
-async function verifyOtp({ phone, otp, name }) {
-  const normalizedPhone = phone.trim();
-
-  const request = await prisma.otpRequest.findFirst({
-    where: { phone: normalizedPhone, consumedAt: null },
-    orderBy: { createdAt: "desc" },
-  });
-
-  if (!request) {
-    throw badRequestError("No active code for this number. Please request a new one.");
-  }
-  if (request.expiresAt < new Date()) {
-    throw badRequestError("That code has expired. Please request a new one.");
-  }
-  if (request.attemptCount >= MAX_VERIFY_ATTEMPTS) {
-    throw badRequestError("Too many incorrect attempts. Please request a new code.", 429);
-  }
-
-  const matches = await compareOtp(otp.trim(), request.otpHash);
-  if (!matches) {
-    await prisma.otpRequest.update({
-      where: { id: request.id },
-      data: { attemptCount: { increment: 1 } },
-    });
-    throw badRequestError("That code isn't correct.");
-  }
-
-  let customer = await prisma.customer.findUnique({ where: { phone: normalizedPhone } });
+  let customer = await prisma.customer.findUnique({ where: { phone } });
   const isNewCustomer = !customer;
 
   if (!customer) {
     if (!name || name.trim().length < 2) {
-      // New number - we need a name before the account can exist. Deliberately
-      // thrown BEFORE the code is consumed, so the retry (which arrives with
-      // the name) still has a valid code to verify against.
+      // New number - we need a name before the account can exist. The
+      // access-token stays valid for the retry (MSG91's, not ours to expire).
       throw badRequestError("NAME_REQUIRED");
     }
     customer = await prisma.customer.create({
-      data: { name: name.trim(), phone: normalizedPhone, lastLoginAt: new Date() },
+      data: { name: name.trim(), phone, lastLoginAt: new Date() },
     });
   } else {
     if (!customer.isActive) {
@@ -125,13 +47,6 @@ async function verifyOtp({ phone, otp, name }) {
       data: { lastLoginAt: new Date() },
     });
   }
-
-  // Consumed only now that login has definitely succeeded - anything that
-  // throws above leaves the code usable for the customer's next attempt.
-  await prisma.otpRequest.update({
-    where: { id: request.id },
-    data: { consumedAt: new Date() },
-  });
 
   const tokens = await issueSession(customer.id);
   return { customer: publicCustomer(customer), tokens, isNewCustomer };
@@ -209,7 +124,6 @@ function publicCustomer(customer) {
 }
 
 module.exports = {
-  requestOtp,
   verifyOtp,
   refreshSession,
   logout,

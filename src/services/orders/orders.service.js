@@ -2,6 +2,7 @@ const prisma = require("../../config/db");
 const { validateStatusUpdate } = require("../../validators/orders/orders.validator");
 const deliverySettingsService = require("../deliverySettings/deliverySettings.service");
 const notificationsService = require("../notifications/notifications.service");
+const razorpayService = require("../payments/razorpay.service");
 
 function notFoundError(message) {
   const err = new Error(message);
@@ -241,32 +242,12 @@ async function getDashboardStats() {
 }
 
 /**
- * Customer-site order creation. Differs from the admin path in three ways:
- *  - re-validates the delivery date against current settings (it may have
- *    expired between page load and submit)
- *  - pulls the delivery charge from settings rather than trusting the client
- *  - records UPI proof as "submitted", never "paid" - an admin must verify
+ * Prices a customer's cart server-side - same rules as createPublicOrder used
+ * to apply inline. Split out so both the "cod" path (creates the Order right
+ * away) and the "razorpay" path (stashes the draft in PendingCheckout until
+ * payment is confirmed) price things identically, from one place.
  */
-async function createPublicOrder(payload, customerId = null) {
-  const {
-    customerName, customerPhone, deliveryAddress, deliveryDate,
-    items, paymentMethod, upiReceiptText, upiTransactionId, notes,
-  } = payload;
-
-  const settings = await deliverySettingsService.getSettings();
-
-  if (paymentMethod === "cod" && !settings.codEnabled) {
-    throw badRequestError("Cash on delivery isn't available right now.");
-  }
-  if (paymentMethod === "upi" && !settings.upiEnabled) {
-    throw badRequestError("UPI payment isn't available right now.");
-  }
-
-  const dateStillValid = await deliverySettingsService.isDateSelectable(deliveryDate);
-  if (!dateStillValid) {
-    throw badRequestError("That delivery date is no longer available. Please pick another.");
-  }
-
+async function priceCheckoutItems(items) {
   const variantIds = items.map((i) => i.productVariantId);
   const variants = await prisma.productVariant.findMany({
     where: { id: { in: variantIds } },
@@ -307,59 +288,138 @@ async function createPublicOrder(payload, customerId = null) {
     });
   }
 
-  const subtotal = lineItems.reduce((sum, li) => sum + li.lineTotal, 0);
-  const isFlatCharge = settings.deliveryChargeMode === "flat";
-  const deliveryCharge = isFlatCharge ? Number(settings.flatDeliveryCharge) : 0;
-  const total = subtotal + deliveryCharge;
+  return lineItems;
+}
 
-  const order = await prisma.$transaction(async (tx) => {
-    const created = await tx.order.create({
-      data: {
-        orderNumber: "PENDING",
-        customerId, // null for guest checkout - the order still works either way
-        customerName: customerName.trim(),
-        customerPhone: customerPhone.trim(),
-        deliveryAddress: deliveryAddress.trim(),
-        deliveryDate: new Date(`${deliveryDate}T00:00:00`),
-        deliveryStartTime: settings.deliveryStartTime,
-        deliveryEndTime: settings.deliveryEndTime,
-        deliveryChargeStatus: isFlatCharge ? "confirmed" : "pending",
-        paymentMethod,
-        paymentStatus: paymentMethod === "upi" ? "submitted" : "unpaid",
-        upiReceiptText: upiReceiptText ? upiReceiptText.trim() : null,
-        upiTransactionId: upiTransactionId ? upiTransactionId.trim() : null,
-        subtotal,
-        deliveryCharge,
-        discount: 0,
-        total,
-        notes: notes ? notes.trim() : null,
-        createdByAdminId: null, // placed by a customer, not staff
-        items: { create: lineItems },
-      },
-    });
-
-    return tx.order.update({
-      where: { id: created.id },
-      data: { orderNumber: `ORD-${1000 + created.id}` },
-      include: orderInclude,
-    });
-  });
-
-  // Alerts the shop that an order came in. Deliberately after the transaction
-  // and never awaited into the failure path - see createNotification.
+/** Alerts the shop that a real, paid-for (or COD) order came in. Deliberately
+ * fire-and-forget - see createNotification - and never called for a
+ * still-unpaid Razorpay draft, since that isn't a real order yet. */
+async function notifyNewOrder(order) {
   const itemSummary = order.items.map((i) => `${i.quantity}x ${i.productName}`).join(", ");
   await notificationsService.createNotification({
     type: "new_order",
     title: `New order ${order.orderNumber}`,
     message:
       `${order.customerName} · Rs.${Number(order.total).toFixed(0)} · ${order.paymentMethod.toUpperCase()}` +
-      (order.paymentMethod === "upi" ? " (payment needs verification)" : "") +
       ` — ${itemSummary}`.slice(0, 480),
     entityType: "Order",
     entityId: order.id,
   });
+}
 
-  return order;
+/**
+ * Customer-site order creation. Differs from the admin path in three ways:
+ *  - re-validates the delivery date against current settings (it may have
+ *    expired between page load and submit)
+ *  - pulls the delivery charge from settings rather than trusting the client
+ *  - for "razorpay", nothing is written to the Order table yet. A customer
+ *    can open the payment widget just to see the final price/a discount and
+ *    close it without ever creating a "phantom" order the shop has to see -
+ *    the priced draft is stashed in PendingCheckout and only becomes a real
+ *    Order once payment is actually confirmed (see promotePendingCheckout).
+ */
+async function createPublicOrder(payload, customerId = null) {
+  const {
+    customerName, customerPhone, deliveryAddress, deliveryDate,
+    items, paymentMethod, notes,
+  } = payload;
+
+  const settings = await deliverySettingsService.getSettings();
+
+  if (paymentMethod === "cod" && !settings.codEnabled) {
+    throw badRequestError("Cash on delivery isn't available right now.");
+  }
+  // The existing "upiEnabled" toggle in Delivery Settings now gates the
+  // Razorpay ("Pay Online") option too - it still means "is online/non-COD
+  // payment available today", just via a gateway instead of a manual UPI ID.
+  if (paymentMethod === "razorpay" && !settings.upiEnabled) {
+    throw badRequestError("Online payment isn't available right now.");
+  }
+
+  const dateStillValid = await deliverySettingsService.isDateSelectable(deliveryDate);
+  if (!dateStillValid) {
+    throw badRequestError("That delivery date is no longer available. Please pick another.");
+  }
+
+  const lineItems = await priceCheckoutItems(items);
+  const subtotal = lineItems.reduce((sum, li) => sum + li.lineTotal, 0);
+  const isFlatCharge = settings.deliveryChargeMode === "flat";
+  const deliveryCharge = isFlatCharge ? Number(settings.flatDeliveryCharge) : 0;
+  const total = subtotal + deliveryCharge;
+
+  if (paymentMethod === "cod") {
+    const order = await prisma.$transaction(async (tx) => {
+      const created = await tx.order.create({
+        data: {
+          orderNumber: "PENDING",
+          customerId, // null for guest checkout - the order still works either way
+          customerName: customerName.trim(),
+          customerPhone: customerPhone.trim(),
+          deliveryAddress: deliveryAddress.trim(),
+          deliveryDate: new Date(`${deliveryDate}T00:00:00`),
+          deliveryStartTime: settings.deliveryStartTime,
+          deliveryEndTime: settings.deliveryEndTime,
+          deliveryChargeStatus: isFlatCharge ? "confirmed" : "pending",
+          paymentMethod,
+          paymentStatus: "unpaid", // collected on delivery
+          subtotal,
+          deliveryCharge,
+          discount: 0,
+          total,
+          notes: notes ? notes.trim() : null,
+          createdByAdminId: null, // placed by a customer, not staff
+          items: { create: lineItems },
+        },
+      });
+
+      return tx.order.update({
+        where: { id: created.id },
+        data: { orderNumber: `ORD-${1000 + created.id}` },
+        include: orderInclude,
+      });
+    });
+
+    await notifyNewOrder(order);
+    return { order, razorpayKeyId: null, razorpayOrderId: null, amount: null };
+  }
+
+  // paymentMethod === "razorpay": open the gateway order, but do NOT create
+  // our own Order row yet - only a PendingCheckout holding everything needed
+  // to build it later. Nothing here is visible to the shop until paid.
+  const razorpayOrder = await razorpayService.createRazorpayOrder({
+    amountInRupees: total,
+    receipt: `checkout-${Date.now()}`,
+    notes: { customerPhone: customerPhone.trim() },
+  });
+
+  await prisma.pendingCheckout.create({
+    data: {
+      razorpayOrderId: razorpayOrder.id,
+      customerId,
+      amount: total,
+      payload: {
+        customerName: customerName.trim(),
+        customerPhone: customerPhone.trim(),
+        deliveryAddress: deliveryAddress.trim(),
+        deliveryDate,
+        notes: notes ? notes.trim() : null,
+        lineItems,
+        subtotal,
+        deliveryCharge,
+        total,
+        isFlatCharge,
+        deliveryStartTime: settings.deliveryStartTime,
+        deliveryEndTime: settings.deliveryEndTime,
+      },
+    },
+  });
+
+  return {
+    order: null,
+    razorpayOrderId: razorpayOrder.id,
+    razorpayKeyId: razorpayService.getPublicKeyId(),
+    amount: total,
+  };
 }
 
 /**
@@ -407,12 +467,12 @@ async function getCustomerOrder(customerId, orderNumber) {
   return order;
 }
 
-/** Admin confirms or rejects a customer-submitted UPI payment. */
+/** Admin confirms or rejects a legacy manual-UPI (phone order) payment. */
 async function verifyPayment(id, { paymentStatus, paymentNote }) {
   const existing = await prisma.order.findUnique({ where: { id } });
   if (!existing) throw notFoundError("Order not found.");
   if (existing.paymentMethod !== "upi") {
-    throw badRequestError("Only UPI payments need verification.");
+    throw badRequestError("Only manually-entered UPI payments need verification.");
   }
 
   return prisma.order.update({
@@ -424,6 +484,113 @@ async function verifyPayment(id, { paymentStatus, paymentNote }) {
     },
     include: orderInclude,
   });
+}
+
+/**
+ * Turns a still-pending checkout draft into the real, shop-visible Order -
+ * the moment (and only the moment) payment is actually confirmed. Called
+ * from both verifyRazorpayPayment (the widget's own success callback) and
+ * the webhook safety net, so it's written to be idempotent either way:
+ *  - if an Order already exists for this razorpayOrderId, that path already
+ *    won the race - just return it, don't create a second one.
+ *  - if no PendingCheckout row exists either, this isn't a checkout we
+ *    started (or it was already promoted and cleaned up) - return null.
+ */
+async function promotePendingCheckout(razorpayOrderId, razorpayPaymentId) {
+  const existingOrder = await prisma.order.findFirst({
+    where: { razorpayOrderId },
+    include: orderInclude,
+  });
+  if (existingOrder) return existingOrder;
+
+  const pending = await prisma.pendingCheckout.findUnique({ where: { razorpayOrderId } });
+  if (!pending) return null;
+
+  const d = pending.payload;
+
+  const order = await prisma.$transaction(async (tx) => {
+    const created = await tx.order.create({
+      data: {
+        orderNumber: "PENDING",
+        customerId: pending.customerId,
+        customerName: d.customerName,
+        customerPhone: d.customerPhone,
+        deliveryAddress: d.deliveryAddress,
+        deliveryDate: new Date(`${d.deliveryDate}T00:00:00`),
+        deliveryStartTime: d.deliveryStartTime,
+        deliveryEndTime: d.deliveryEndTime,
+        deliveryChargeStatus: d.isFlatCharge ? "confirmed" : "pending",
+        paymentMethod: "razorpay",
+        paymentStatus: "paid",
+        razorpayOrderId,
+        razorpayPaymentId,
+        paymentVerifiedAt: new Date(),
+        subtotal: d.subtotal,
+        deliveryCharge: d.deliveryCharge,
+        discount: 0,
+        total: d.total,
+        notes: d.notes,
+        createdByAdminId: null,
+        items: { create: d.lineItems },
+      },
+    });
+
+    const withNumber = await tx.order.update({
+      where: { id: created.id },
+      data: { orderNumber: `ORD-${1000 + created.id}` },
+      include: orderInclude,
+    });
+
+    // Draft's job is done - remove it so it can't be promoted twice.
+    await tx.pendingCheckout.delete({ where: { id: pending.id } });
+
+    return withNumber;
+  });
+
+  await notifyNewOrder(order);
+  await notificationsService.createNotification({
+    type: "payment_received",
+    title: `Payment received for ${order.orderNumber}`,
+    message: `${order.customerName} · Rs.${Number(order.total).toFixed(0)} · paid via Razorpay`,
+    entityType: "Order",
+    entityId: order.id,
+  });
+
+  return order;
+}
+
+/**
+ * Confirms a Razorpay payment the checkout widget just completed. The
+ * signature is the actual cryptographic proof of payment; once it checks
+ * out, this is the first moment the customer's order becomes real (see
+ * promotePendingCheckout) - so a customer who never gets this far (closes
+ * the widget, payment fails) never leaves anything for the shop to see.
+ */
+async function verifyRazorpayPayment({ razorpayOrderId, razorpayPaymentId, razorpaySignature }) {
+  const isValid = razorpayService.verifyPaymentSignature({ razorpayOrderId, razorpayPaymentId, razorpaySignature });
+  if (!isValid) {
+    throw badRequestError("Payment verification failed. Please try again or contact us.");
+  }
+
+  const order = await promotePendingCheckout(razorpayOrderId, razorpayPaymentId);
+  if (!order) {
+    throw notFoundError(
+      "We couldn't find this checkout. If money was deducted, it will reflect shortly - please check My Orders."
+    );
+  }
+  return order;
+}
+
+/**
+ * Safety net for the case where the customer paid but their browser closed
+ * (or the network dropped) before the widget's own success callback could
+ * call verifyRazorpayPayment. Razorpay retries this webhook until it gets a
+ * 200, so promotePendingCheckout's idempotency is what makes that safe - it
+ * either creates the order for the first time here, or finds the widget path
+ * already did, and never throws for a payment it doesn't recognise.
+ */
+async function markOrderPaidFromWebhook({ razorpayOrderId, razorpayPaymentId }) {
+  return promotePendingCheckout(razorpayOrderId, razorpayPaymentId);
 }
 
 /** Used in manual charge mode, once the admin has checked the address. */
@@ -465,6 +632,8 @@ module.exports = {
   listCustomerOrders,
   getCustomerOrder,
   verifyPayment,
+  verifyRazorpayPayment,
+  markOrderPaidFromWebhook,
   setDeliveryCharge,
   assignDeliveryPerson,
 };

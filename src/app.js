@@ -22,7 +22,17 @@ const ALLOWED_ORIGINS = [
   .filter(Boolean);
 
 app.use(cors({ origin: ALLOWED_ORIGINS, credentials: true }));
-app.use(express.json());
+// verify: captures the exact raw request bytes onto req.rawBody. The Razorpay
+// webhook signature is computed over the raw body, not the parsed object -
+// this is the cheapest way to keep that available without a second,
+// route-specific body parser just for one endpoint.
+app.use(
+  express.json({
+    verify: (req, res, buf) => {
+      req.rawBody = buf;
+    },
+  })
+);
 app.use(cookieParser());
 app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
 
