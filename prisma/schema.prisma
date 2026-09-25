@@ -1,3 +1,6 @@
+// Phase: Auth + RBAC (done) + Products/Categories catalogue (this phase).
+// Order/coupon/delivery tables still to come.
+
 generator client {
   provider = "prisma-client-js"
 }
@@ -9,46 +12,65 @@ datasource db {
 
 model Role {
   id          Int         @id @default(autoincrement())
+  // "owner" | "manager" | "staff" are system roles seeded at setup and can never
+  // be deleted. Custom roles (e.g. "delivery-staff") are created via the admin UI.
   name        String      @unique @db.VarChar(50)
   label       String      @db.VarChar(100)
+  // Array of permission key strings from src/permissions/permissions.json's
+  // module catalog, e.g. ["orders:view", "products:*"]. "*" means everything.
   permissions Json
   isSystem    Boolean     @default(false) @map("is_system")
   createdAt   DateTime    @default(now()) @map("created_at")
   updatedAt   DateTime    @updatedAt @map("updated_at")
+
   adminUsers  AdminUser[]
 
   @@map("roles")
 }
 
 model AdminUser {
-  id            Int        @id @default(autoincrement())
-  name          String     @db.VarChar(100)
-  email         String     @unique @db.VarChar(150)
-  passwordHash  String     @map("password_hash") @db.VarChar(255)
-  isActive      Boolean    @default(true) @map("is_active")
-  lastLoginAt   DateTime?  @map("last_login_at")
-  createdAt     DateTime   @default(now()) @map("created_at")
-  updatedAt     DateTime   @updatedAt @map("updated_at")
-  roleId        Int        @map("role_id")
-  preferences   Json
-  role          Role       @relation(fields: [roleId], references: [id])
-  auditLogs     AuditLog[]
+  id           Int        @id @default(autoincrement())
+  name         String     @db.VarChar(100)
+  email        String     @unique @db.VarChar(150)
+  passwordHash String     @map("password_hash") @db.VarChar(255)
+  // Nullable because existing admins predate this column. Required before that
+  // admin can use SMS password reset. Unique so a number maps to one account.
+  phone        String?    @unique @db.VarChar(20)
+  // Any JWT issued before this moment is rejected, so resetting a password
+  // logs out every existing session - otherwise a stolen token would survive
+  // the reset until its natural expiry.
+  passwordChangedAt DateTime? @map("password_changed_at")
+  roleId       Int        @map("role_id")
+  role         Role       @relation(fields: [roleId], references: [id])
+  isActive     Boolean    @default(true) @map("is_active")
+  // Personal UI preferences - e.g. { "showAuditLog": false }. Deliberately a
+  // free-form JSON blob rather than dedicated columns, so new per-admin
+  // preferences can be added later without another migration.
+  preferences  Json       @default("{}")
+  lastLoginAt  DateTime?  @map("last_login_at")
+  createdAt    DateTime   @default(now()) @map("created_at")
+  updatedAt    DateTime   @updatedAt @map("updated_at")
+
+  auditLogs    AuditLog[]
   createdOrders Order[]
+  passwordResets AdminPasswordReset[]
 
   @@index([roleId])
   @@map("admin_users")
 }
 
 model AuditLog {
-  id        Int        @id @default(autoincrement())
-  adminId   Int?       @map("admin_id")
-  action    String     @db.VarChar(100)
-  entity    String?    @db.VarChar(100)
-  entityId  Int?       @map("entity_id")
-  metadata  Json?
-  ipAddress String?    @map("ip_address") @db.VarChar(45)
-  createdAt DateTime   @default(now()) @map("created_at")
-  admin     AdminUser? @relation(fields: [adminId], references: [id])
+  id         Int       @id @default(autoincrement())
+  adminId    Int?      @map("admin_id")
+  admin      AdminUser? @relation(fields: [adminId], references: [id], onDelete: SetNull)
+  // action must be a permission key from src/permissions/permissions.json
+  // (or "auth:loginFailed" style event key for security-relevant non-permission events)
+  action     String    @db.VarChar(100)
+  entity     String?   @db.VarChar(100)
+  entityId   Int?      @map("entity_id")
+  metadata   Json?
+  ipAddress  String?   @map("ip_address") @db.VarChar(45)
+  createdAt  DateTime  @default(now()) @map("created_at")
 
   @@index([adminId])
   @@index([action])
@@ -63,57 +85,74 @@ model Category {
   isActive  Boolean   @default(true) @map("is_active")
   createdAt DateTime  @default(now()) @map("created_at")
   updatedAt DateTime  @updatedAt @map("updated_at")
+
   products  Product[]
 
   @@map("categories")
 }
 
 model Product {
-  id           Int                  @id @default(autoincrement())
-  categoryId   Int                  @map("category_id")
-  name         String               @db.VarChar(150)
-  description  String?              @db.Text
-  imageUrl     String?              @map("image_url") @db.VarChar(500)
-  isActive     Boolean              @default(true) @map("is_active")
-  sortOrder    Int                  @default(0) @map("sort_order")
-  createdAt    DateTime             @default(now()) @map("created_at")
-  updatedAt    DateTime             @updatedAt @map("updated_at")
-  imagePath    String?              @map("image_path") @db.VarChar(500)
-  isInStock    Boolean              @default(true) @map("is_in_stock")
-  optionGroups ProductOptionGroup[]
-  variants     ProductVariant[]
-  category     Category             @relation(fields: [categoryId], references: [id])
+  id            Int              @id @default(autoincrement())
+  categoryId    Int              @map("category_id")
+  category      Category         @relation(fields: [categoryId], references: [id])
+  name          String           @db.VarChar(150)
+  description   String?          @db.Text
+  imageUrl      String?          @map("image_url") @db.VarChar(500)
+  // Relative path under /uploads (e.g. "products/5/1719900000000.jpg") - used
+  // to delete/replace the old file on disk when a new image is uploaded.
+  imagePath     String?          @map("image_path") @db.VarChar(500)
+  // isActive = exists in the catalogue at all (soft delete).
+  // isInStock = available to order today. Separate concepts: the owner pulls an
+  // item for a day without deleting it, in one click instead of per-variant.
+  isActive      Boolean          @default(true) @map("is_active")
+  isInStock     Boolean          @default(true) @map("is_in_stock")
+  sortOrder     Int              @default(0) @map("sort_order")
+  createdAt     DateTime         @default(now()) @map("created_at")
+  updatedAt     DateTime         @updatedAt @map("updated_at")
+
+  variants      ProductVariant[]
+  optionGroups  ProductOptionGroup[]
 
   @@index([categoryId])
   @@map("products")
 }
 
 model ProductVariant {
-  id         Int         @id @default(autoincrement())
-  productId  Int         @map("product_id")
-  label      String      @db.VarChar(50)
-  price      Decimal     @db.Decimal(10, 2)
-  isInStock  Boolean     @default(true) @map("is_in_stock")
-  sortOrder  Int         @default(0) @map("sort_order")
-  createdAt  DateTime    @default(now()) @map("created_at")
-  updatedAt  DateTime    @updatedAt @map("updated_at")
+  id        Int      @id @default(autoincrement())
+  productId Int      @map("product_id")
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  // Free-text label so it covers both weight tiers ("500 GM") and piece-based
+  // items ("4 Pieces") without forcing every product into a fixed weight enum.
+  label     String   @db.VarChar(50)
+  price     Decimal  @db.Decimal(10, 2)
+  isInStock Boolean  @default(true) @map("is_in_stock")
+  sortOrder Int      @default(0) @map("sort_order")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
   orderItems OrderItem[]
-  product    Product     @relation(fields: [productId], references: [id], onDelete: Cascade)
 
   @@index([productId])
   @@map("product_variants")
 }
 
+// A variant answers "how much" (250 GM / 1 KG). An option group answers
+// "prepared how" (Tandoori / Korma). Grouping them means a product can later
+// gain a second group - say Cut Style - without another migration.
 model ProductOptionGroup {
   id            Int             @id @default(autoincrement())
   productId     Int             @map("product_id")
+  product       Product         @relation(fields: [productId], references: [id], onDelete: Cascade)
+
   name          String          @db.VarChar(100)
+  // Required means the customer must choose before adding to cart.
   isRequired    Boolean         @default(false) @map("is_required")
+  // Single-select (pick one marination) vs multi-select (add extras).
   allowMultiple Boolean         @default(false) @map("allow_multiple")
   sortOrder     Int             @default(0) @map("sort_order")
   createdAt     DateTime        @default(now()) @map("created_at")
   updatedAt     DateTime        @updatedAt @map("updated_at")
-  product       Product         @relation(fields: [productId], references: [id], onDelete: Cascade)
+
   options       ProductOption[]
 
   @@index([productId])
@@ -123,103 +162,201 @@ model ProductOptionGroup {
 model ProductOption {
   id          Int                @id @default(autoincrement())
   groupId     Int                @map("group_id")
+  group       ProductOptionGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+
   name        String             @db.VarChar(100)
-  extraPrice  Decimal            @default(0.00) @map("extra_price") @db.Decimal(10, 2)
+  // Added ON TOP of the variant price, per unit.
+  extraPrice  Decimal            @default(0) @map("extra_price") @db.Decimal(10, 2)
   isAvailable Boolean            @default(true) @map("is_available")
   sortOrder   Int                @default(0) @map("sort_order")
   createdAt   DateTime           @default(now()) @map("created_at")
   updatedAt   DateTime           @updatedAt @map("updated_at")
-  group       ProductOptionGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
 
   @@index([groupId])
   @@map("product_options")
 }
 
 model Order {
-  id                   Int         @id @default(autoincrement())
-  orderNumber          String      @unique @map("order_number") @db.VarChar(20)
-  customerName         String      @map("customer_name") @db.VarChar(150)
-  customerPhone        String      @map("customer_phone") @db.VarChar(20)
-  deliveryAddress      String?     @map("delivery_address") @db.Text
-  status               String      @default("placed") @db.VarChar(30)
-  paymentMethod        String      @default("cod") @map("payment_method") @db.VarChar(20)
-  paymentStatus        String      @default("unpaid") @map("payment_status") @db.VarChar(20)
-  subtotal             Decimal     @db.Decimal(10, 2)
-  deliveryCharge       Decimal     @default(0.00) @map("delivery_charge") @db.Decimal(10, 2)
-  discount             Decimal     @default(0.00) @db.Decimal(10, 2)
-  total                Decimal     @db.Decimal(10, 2)
-  notes                String?     @db.Text
-  createdByAdminId     Int?        @map("created_by_admin_id")
-  createdAt            DateTime    @default(now()) @map("created_at")
-  updatedAt            DateTime    @updatedAt @map("updated_at")
-  deliveryChargeStatus String      @default("confirmed") @map("delivery_charge_status") @db.VarChar(20)
-  deliveryDate         DateTime?   @map("delivery_date") @db.Date
-  deliveryEndTime      String?     @map("delivery_end_time") @db.VarChar(5)
-  deliveryPersonName   String?     @map("delivery_person_name") @db.VarChar(100)
-  deliveryStartTime    String?     @map("delivery_start_time") @db.VarChar(5)
-  paymentNote          String?     @map("payment_note") @db.VarChar(255)
-  paymentVerifiedAt    DateTime?   @map("payment_verified_at")
-  upiReceiptText       String?     @map("upi_receipt_text") @db.Text
-  upiTransactionId     String?     @map("upi_transaction_id") @db.VarChar(100)
-  customerId           Int?        @map("customer_id")
-  items                OrderItem[]
-  createdByAdmin       AdminUser?  @relation(fields: [createdByAdminId], references: [id])
-  customer             Customer?   @relation(fields: [customerId], references: [id])
+  id                Int         @id @default(autoincrement())
+  // Human-readable, generated right after creation from the row's own id
+  // (e.g. "ORD-1001") - unique by construction, no separate counter needed.
+  orderNumber       String      @unique @map("order_number") @db.VarChar(20)
+
+  // No customer accounts exist yet (guest-style order, same shape a future
+  // customer-site checkout will use) - captured directly on the order so a
+  // phone/WhatsApp order taken by staff looks identical to one placed online later.
+  // Null for staff-entered phone orders - those keep working exactly as before.
+  customerId        Int?        @map("customer_id")
+  customer          Customer?   @relation(fields: [customerId], references: [id], onDelete: SetNull)
+
+  customerName      String      @map("customer_name") @db.VarChar(150)
+  customerPhone     String      @map("customer_phone") @db.VarChar(20)
+  deliveryAddress   String?     @map("delivery_address") @db.Text
+
+  // placed -> preparing -> out_for_delivery -> delivered, or cancelled from placed/preparing
+  status            String      @default("placed") @db.VarChar(30)
+
+  // cod | upi | razorpay
+  // upi = legacy manual UPI (kept for old orders / staff phone-order entry,
+  //   no longer offered on the customer-facing checkout)
+  // razorpay = online payment gateway (card/UPI/netbanking via Razorpay's widget)
+  paymentMethod     String      @default("cod") @map("payment_method") @db.VarChar(20)
+  // COD: unpaid -> paid (on delivery)
+  // UPI (legacy): submitted -> verified | rejected
+  // Razorpay: pending -> paid | failed
+  paymentStatus     String      @default("unpaid") @map("payment_status") @db.VarChar(20)
+
+  // What the customer pasted from their UPI app's "share receipt", and/or the
+  // UTR they typed. Stored raw and read by a human - deliberately not parsed,
+  // since every UPI app formats its receipt differently. Legacy manual-UPI
+  // fields - no longer written by new orders, kept so old order history reads fine.
+  upiReceiptText    String?     @map("upi_receipt_text") @db.Text
+  upiTransactionId  String?     @map("upi_transaction_id") @db.VarChar(100)
+
+  // Razorpay's own order id (created at checkout) and payment id (set once
+  // paid). Together with the signature, these are what verification checks.
+  razorpayOrderId   String?     @map("razorpay_order_id") @db.VarChar(100)
+  razorpayPaymentId String?     @map("razorpay_payment_id") @db.VarChar(100)
+
+  paymentVerifiedAt DateTime?   @map("payment_verified_at")
+  paymentNote       String?     @map("payment_note") @db.VarChar(255)
+
+  // Snapshot of the delivery window as it stood when the order was placed -
+  // changing the shop's hours later must not rewrite past orders.
+  deliveryDate      DateTime?   @map("delivery_date") @db.Date
+  deliveryStartTime String?     @map("delivery_start_time") @db.VarChar(5)
+  deliveryEndTime   String?     @map("delivery_end_time") @db.VarChar(5)
+
+  // "confirmed" (flat mode - amount known at checkout) or
+  // "pending" (manual mode - admin sets it after checking the address)
+  deliveryChargeStatus String   @default("confirmed") @map("delivery_charge_status") @db.VarChar(20)
+
+  // Free-text name of whoever is delivering. There is one delivery boy today;
+  // a full staff table would be over-engineering for that.
+  deliveryPersonName String?    @map("delivery_person_name") @db.VarChar(100)
+
+  subtotal          Decimal     @db.Decimal(10, 2)
+  deliveryCharge    Decimal     @default(0) @map("delivery_charge") @db.Decimal(10, 2)
+  discount          Decimal     @default(0) @db.Decimal(10, 2)
+  total             Decimal     @db.Decimal(10, 2)
+
+  notes             String?     @db.Text
+
+  // Which staff member recorded a manually-taken order - null once real
+  // customer-site checkout exists and an order isn't staff-entered.
+  createdByAdminId  Int?        @map("created_by_admin_id")
+  createdByAdmin    AdminUser?  @relation(fields: [createdByAdminId], references: [id], onDelete: SetNull)
+
+  createdAt         DateTime    @default(now()) @map("created_at")
+  updatedAt         DateTime    @updatedAt @map("updated_at")
+
+  items             OrderItem[]
 
   @@index([status])
   @@index([createdAt])
   @@index([customerId])
-  @@index([createdByAdminId], map: "orders_created_by_admin_id_fkey")
   @@map("orders")
 }
 
 model OrderItem {
-  id               Int             @id @default(autoincrement())
-  orderId          Int             @map("order_id")
-  productVariantId Int?            @map("product_variant_id")
-  productName      String          @map("product_name") @db.VarChar(150)
-  variantLabel     String          @map("variant_label") @db.VarChar(50)
-  unitPrice        Decimal         @map("unit_price") @db.Decimal(10, 2)
-  quantity         Int
-  lineTotal        Decimal         @map("line_total") @db.Decimal(10, 2)
-  optionsTotal     Decimal         @default(0.00) @map("options_total") @db.Decimal(10, 2)
-  selectedOptions  Json?           @map("selected_options")
-  order            Order           @relation(fields: [orderId], references: [id], onDelete: Cascade)
-  productVariant   ProductVariant? @relation(fields: [productVariantId], references: [id])
+  id                Int             @id @default(autoincrement())
+  orderId           Int             @map("order_id")
+  order             Order           @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  // Nullable + snapshot fields: if the variant is edited or deleted later,
+  // this line item still shows exactly what the customer actually ordered.
+  productVariantId  Int?            @map("product_variant_id")
+  productVariant    ProductVariant? @relation(fields: [productVariantId], references: [id], onDelete: SetNull)
+  productName       String          @map("product_name") @db.VarChar(150)
+  variantLabel      String          @map("variant_label") @db.VarChar(50)
+
+  unitPrice         Decimal         @map("unit_price") @db.Decimal(10, 2)
+  // Snapshot of chosen options: [{ groupName, optionName, extraPrice }].
+  // Stored rather than joined so editing an option later never rewrites history.
+  selectedOptions   Json?           @map("selected_options")
+  // Per-unit total of those options. lineTotal = (unitPrice + optionsTotal) * quantity
+  optionsTotal      Decimal         @default(0) @map("options_total") @db.Decimal(10, 2)
+  quantity          Int
+  lineTotal         Decimal         @map("line_total") @db.Decimal(10, 2)
 
   @@index([orderId])
-  @@index([productVariantId], map: "order_items_product_variant_id_fkey")
   @@map("order_items")
 }
 
+// Holds a validated, priced checkout draft while a customer is on the
+// Razorpay widget. Nothing here becomes a real Order (visible to the shop,
+// counted in stats, or triggering a notification) until the payment is
+// actually verified - so someone who opens the widget just to see the final
+// price or a discount, then closes it, never creates clutter on the admin
+// side. Promoted into a real Order and deleted the moment payment succeeds
+// (see promotePendingCheckout in orders.service.js); a row left behind by an
+// abandoned checkout is harmless and can be cleaned up periodically.
+model PendingCheckout {
+  id              Int      @id @default(autoincrement())
+  razorpayOrderId String   @unique @map("razorpay_order_id") @db.VarChar(100)
+  customerId      Int?     @map("customer_id")
+  payload         Json
+  amount          Decimal  @db.Decimal(10, 2)
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  @@map("pending_checkouts")
+}
+// Singleton - exactly one row (id = 1), created on first read if missing.
+// Every delivery business rule lives here rather than in code, so the owner
+// can change operating days/hours/charges from the admin without a developer.
 model DeliverySettings {
-  id                 Int      @id @default(1)
-  availableDays      Json     @map("available_days")
-  deliveryStartTime  String   @default("06:00") @map("delivery_start_time") @db.VarChar(5)
-  deliveryEndTime    String   @default("11:00") @map("delivery_end_time") @db.VarChar(5)
-  sameDayEnabled     Boolean  @default(true) @map("same_day_enabled")
-  nextDayEnabled     Boolean  @default(true) @map("next_day_enabled")
-  maxAdvanceDays     Int      @default(3) @map("max_advance_days")
-  sameDayCutoffTime  String?  @map("same_day_cutoff_time") @db.VarChar(5)
-  deliveryChargeMode String   @default("flat") @map("delivery_charge_mode") @db.VarChar(20)
-  flatDeliveryCharge Decimal  @default(0.00) @map("flat_delivery_charge") @db.Decimal(10, 2)
-  deliveryAreaNote   String   @default("We deliver across Gurugram.") @map("delivery_area_note") @db.VarChar(255)
-  updatedAt          DateTime @updatedAt @map("updated_at")
-  codEnabled         Boolean  @default(true) @map("cod_enabled")
-  upiEnabled         Boolean  @default(true) @map("upi_enabled")
-  upiId              String   @default("starhalal@upi") @map("upi_id") @db.VarChar(100)
-  upiPayeeName       String   @default("Star Halal Meat Shop") @map("upi_payee_name") @db.VarChar(100)
+  id                  Int      @id @default(1)
+
+  // Lowercase day names, e.g. ["sunday","monday","wednesday","thursday","friday"].
+  // An array rather than 7 boolean columns so adding/removing a day is a data edit.
+  availableDays       Json     @map("available_days")
+
+  deliveryStartTime   String   @default("06:00") @map("delivery_start_time") @db.VarChar(5)
+  deliveryEndTime     String   @default("11:00") @map("delivery_end_time") @db.VarChar(5)
+
+  sameDayEnabled      Boolean  @default(true) @map("same_day_enabled")
+  nextDayEnabled      Boolean  @default(true) @map("next_day_enabled")
+  maxAdvanceDays      Int      @default(3) @map("max_advance_days")
+
+  // NULL = no cutoff enforced yet (owner hasn't decided the time).
+  // Once set (e.g. "20:00"), same-day ordering closes after it.
+  sameDayCutoffTime   String?  @map("same_day_cutoff_time") @db.VarChar(5)
+
+  // "flat"   -> flatDeliveryCharge applied automatically at checkout
+  // "manual" -> charge confirmed by admin per-order after checking the address
+  //             (supports the "Uber Bike fare - Rs.10" rule, which needs a human)
+  deliveryChargeMode  String   @default("flat") @map("delivery_charge_mode") @db.VarChar(20)
+  flatDeliveryCharge  Decimal  @default(0) @map("flat_delivery_charge") @db.Decimal(10, 2)
+
+  deliveryAreaNote    String   @default("We deliver across Gurugram.") @map("delivery_area_note") @db.VarChar(255)
+
+  // Payment methods the customer may choose. Either can be switched off if
+  // something goes wrong with it operationally.
+  codEnabled          Boolean  @default(true) @map("cod_enabled")
+  upiEnabled          Boolean  @default(true) @map("upi_enabled")
+  // Shown on the UPI payment screen. Placeholder until the owner supplies the real ID.
+  upiId               String   @default("starhalal@upi") @map("upi_id") @db.VarChar(100)
+  upiPayeeName        String   @default("Star Halal Meat Shop") @map("upi_payee_name") @db.VarChar(100)
+
+  updatedAt           DateTime @updatedAt @map("updated_at")
 
   @@map("delivery_settings")
 }
 
+// Shop-wide notifications (not per-admin). With one owner and a helper,
+// per-user read state would be over-engineering - anyone clearing a
+// notification clears it for everyone, which matches how the shop works.
 model Notification {
   id         Int       @id @default(autoincrement())
+  // "new_order" | "payment_submitted" - extensible without a migration
   type       String    @db.VarChar(50)
   title      String    @db.VarChar(150)
   message    String    @db.VarChar(500)
+
+  // Lets the UI deep-link to the thing that triggered it.
   entityType String?   @map("entity_type") @db.VarChar(50)
   entityId   Int?      @map("entity_id")
+
   isRead     Boolean   @default(false) @map("is_read")
   readAt     DateTime? @map("read_at")
   createdAt  DateTime  @default(now()) @map("created_at")
@@ -229,18 +366,22 @@ model Notification {
   @@map("notifications")
 }
 
+// Customer accounts. Entirely separate from AdminUser - different auth,
+// different tokens, different cookies. An admin token must never authenticate
+// a customer, or vice versa.
 model Customer {
-  id            Int                    @id @default(autoincrement())
-  name          String                 @db.VarChar(150)
-  phone         String                 @unique @db.VarChar(20)
-  email         String?                @db.VarChar(150)
-  isActive      Boolean                @default(true) @map("is_active")
-  lastLoginAt   DateTime?              @map("last_login_at")
-  createdAt     DateTime               @default(now()) @map("created_at")
-  updatedAt     DateTime               @updatedAt @map("updated_at")
-  addresses     CustomerAddress[]
-  refreshTokens CustomerRefreshToken[]
-  orders        Order[]
+  id        Int       @id @default(autoincrement())
+  name      String    @db.VarChar(150)
+  phone     String    @unique @db.VarChar(20)
+  email     String?   @db.VarChar(150)
+  isActive  Boolean   @default(true) @map("is_active")
+  lastLoginAt DateTime? @map("last_login_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+
+  addresses      CustomerAddress[]
+  refreshTokens  CustomerRefreshToken[]
+  orders         Order[]
 
   @@map("customers")
 }
@@ -248,21 +389,27 @@ model Customer {
 model CustomerAddress {
   id          Int      @id @default(autoincrement())
   customerId  Int      @map("customer_id")
+  customer    Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
   label       String   @default("Home") @db.VarChar(50)
   addressLine String   @map("address_line") @db.Text
   area        String?  @db.VarChar(150)
   pincode     String?  @db.VarChar(10)
+
+  // Captured from the map pin at checkout - drives distance-based delivery pricing.
   latitude    Decimal? @db.Decimal(10, 7)
   longitude   Decimal? @db.Decimal(10, 7)
+
   isDefault   Boolean  @default(false) @map("is_default")
   createdAt   DateTime @default(now()) @map("created_at")
   updatedAt   DateTime @updatedAt @map("updated_at")
-  customer    Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
 
   @@index([customerId])
   @@map("customer_addresses")
 }
 
+// One row per OTP request. The code itself is hashed - a leaked database
+// shouldn't hand out working login codes.
 model OtpRequest {
   id           Int       @id @default(autoincrement())
   phone        String    @db.VarChar(20)
@@ -277,34 +424,75 @@ model OtpRequest {
   @@map("otp_requests")
 }
 
+// Refresh tokens are stored hashed and rotated on every use. If a token that
+// was already rotated away gets presented again, that's a theft signal and
+// every session for that customer is revoked.
 model CustomerRefreshToken {
   id         Int       @id @default(autoincrement())
   customerId Int       @map("customer_id")
+  customer   Customer  @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
   tokenHash  String    @unique @map("token_hash") @db.VarChar(255)
   expiresAt  DateTime  @map("expires_at")
   revokedAt  DateTime? @map("revoked_at")
   createdAt  DateTime  @default(now()) @map("created_at")
-  customer   Customer  @relation(fields: [customerId], references: [id], onDelete: Cascade)
 
   @@index([customerId])
   @@map("customer_refresh_tokens")
 }
 
+// Singleton (id = 1), created on first read. Everything a customer-facing
+// page states as fact lives here, so the owner can correct a phone number or
+// rewrite the shop's story without a developer.
 model ShopInfo {
   id              Int      @id @default(1)
+
   shopName        String   @default("Meat Vanta") @map("shop_name") @db.VarChar(100)
   tagline         String   @default("Fresh Every Morning") @db.VarChar(150)
   yearsInBusiness Int      @default(35) @map("years_in_business")
+
   phone           String   @default("") @db.VarChar(20)
   whatsappNumber  String   @default("") @map("whatsapp_number") @db.VarChar(20)
   email           String   @default("") @db.VarChar(150)
-  addressLine     String   @map("address_line") @db.Text
+
+  addressLine     String   @default("") @map("address_line") @db.Text
+  // Google Maps share link - rendered as a "Get directions" button.
   mapUrl          String   @default("") @map("map_url") @db.VarChar(500)
   shopHours       String   @default("") @map("shop_hours") @db.VarChar(255)
-  aboutStory      String   @map("about_story") @db.Text
-  qualityPromise  String   @map("quality_promise") @db.Text
+
+  // Long-form copy for the About page. Blank lines separate paragraphs.
+  aboutStory      String   @default("") @map("about_story") @db.Text
+  qualityPromise  String   @default("") @map("quality_promise") @db.Text
+
   fssaiNumber     String   @default("") @map("fssai_number") @db.VarChar(50)
+
   updatedAt       DateTime @updatedAt @map("updated_at")
 
   @@map("shop_info")
 }
+
+
+// Deliberately separate from the customer OtpRequest table. Password reset is
+// higher-stakes than login, and keeping the flows apart means a bug in one
+// cannot weaken the other.
+model AdminPasswordReset {
+  id           Int       @id @default(autoincrement())
+  adminId      Int       @map("admin_id")
+  admin        AdminUser @relation(fields: [adminId], references: [id], onDelete: Cascade)
+
+  otpHash      String    @map("otp_hash") @db.VarChar(255)
+  // Issued only after the OTP is verified; required to actually set a new
+  // password. Splitting verify from reset keeps the OTP out of the final call.
+  resetTokenHash String? @map("reset_token_hash") @db.VarChar(255)
+
+  expiresAt    DateTime  @map("expires_at")
+  attemptCount Int       @default(0) @map("attempt_count")
+  consumedAt   DateTime? @map("consumed_at")
+  createdAt    DateTime  @default(now()) @map("created_at")
+
+  @@index([adminId])
+  @@index([expiresAt])
+  @@map("admin_password_resets")
+}
+
+

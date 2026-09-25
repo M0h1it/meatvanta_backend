@@ -30,6 +30,13 @@ async function verifyWidgetAccessToken(accessToken) {
   const json = await response.json().catch(() => null);
 
   if (!response.ok || !json || json.type !== "success") {
+    // Log MSG91's raw reply server-side (never sent to the client) so a
+    // rejected login can be diagnosed later - bad authkey, expired token,
+    // IP restriction, etc - without needing to reproduce it live.
+    console.error("[MSG91 verifyAccessToken] rejected:", {
+      httpStatus: response.status,
+      body: json,
+    });
     const err = new Error("That code couldn't be verified. Please request a new one.");
     err.statusCode = 400;
     err.expose = true;
