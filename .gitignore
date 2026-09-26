@@ -9,4 +9,3 @@ uploads/products/*
 # Database dumps/backups - these hold real customer data (names, phones,
 # addresses, orders). They must never be committed - keep them off git
 # entirely, store backups somewhere access-controlled instead (e.g. R2/S3).
-*.sql
